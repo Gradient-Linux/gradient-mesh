@@ -1,0 +1,23 @@
+[Unit]
+Description=Gradient Linux Fleet Discovery Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gradient-svc
+Group=gradient-svc
+ExecStart=/usr/local/bin/gradient-mesh run
+Restart=on-failure
+RestartSec=15s
+RuntimeDirectory=gradient
+RuntimeDirectoryMode=0755
+SupplementaryGroups=gradient-admin
+ReadWritePaths=/run/gradient /var/lib/gradient
+CPUQuota=5%
+MemoryMax=64M
+Nice=15
+
+[Install]
+WantedBy=multi-user.target
+
