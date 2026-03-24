@@ -1,10 +1,18 @@
-# Documentation Index
+# gradient-mesh docs
 
-This directory starts with the core mesh daemon notes.
+This directory tracks the public repository documentation for `gradient-mesh`.
 
-## Topics
+## Start here
 
-- `README.md` at the repo root covers build and runtime usage.
-- `internal/mesh` contains the daemon scaffold and tests.
-- `scripts/gradient-mesh.service` defines the systemd unit.
+- [README.md](../README.md) explains the daemon boundary, runtime model, and local commands.
+- [CONTRIBUTING.md](../CONTRIBUTING.md) covers build, test, and review expectations.
 
+## Runtime contract
+
+- Default socket: `/run/gradient/mesh.sock`
+- Default mode: peer-to-peer LAN discovery over mDNS
+- CLI entrypoints: `run`, `version`, `help`
+
+## Scope
+
+`gradient-mesh` owns node discovery and peer snapshots. It does not manage suites, resolve Python environments, or run notebooks.
