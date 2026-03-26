@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -54,6 +56,10 @@ func (d *Daemon) Run(ctx context.Context, cfg MeshConfig) error {
 		d = NewDaemon()
 	}
 	cfg = normalizeConfig(cfg)
+	if persisted, err := LoadMeshConfig(cfg.WorkspaceRoot); err == nil {
+		cfg.Visibility = persisted.Visibility
+		cfg.Peers = persisted.Peers
+	}
 
 	peers := &PeerList{}
 	self, err := d.SelfInfo(cfg.WorkspaceRoot)
@@ -62,7 +68,7 @@ func (d *Daemon) Run(ctx context.Context, cfg MeshConfig) error {
 	}
 	self.Visibility = cfg.Visibility
 	self.LastSeen = time.Now().UTC()
-	state := &nodeState{self: self}
+	state := newDaemonState(cfg, self)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -85,13 +91,10 @@ func (d *Daemon) Run(ctx context.Context, cfg MeshConfig) error {
 	}
 
 	start(func(runCtx context.Context) error {
-		return d.Broadcaster.Broadcast(runCtx, cfg, self)
-	})
-	start(func(runCtx context.Context) error {
-		return d.Discoverer.Discover(runCtx, cfg, peers)
-	})
-	start(func(runCtx context.Context) error {
 		return ServeSocket(runCtx, socketPathOrDefault(d.SocketPath), d.snapshotProvider(state, peers))
+	})
+	start(func(runCtx context.Context) error {
+		return d.networkLoop(runCtx, state, peers)
 	})
 	start(func(runCtx context.Context) error {
 		return d.refreshLoop(runCtx, cfg.WorkspaceRoot, state)
@@ -132,6 +135,7 @@ func SelfInfo(workspaceRoot string) (NodeInfo, error) {
 
 	machineID, _ := readMachineID()
 	suites, _ := readInstalledSuites(filepath.Join(normalizeWorkspaceRoot(workspaceRoot), "config", "state.json"))
+	baselineGroups, driftedGroups, baselineUpdated := nodeSummary(normalizeWorkspaceRoot(workspaceRoot))
 
 	return NodeInfo{
 		Hostname:        hostname,
@@ -139,13 +143,16 @@ func SelfInfo(workspaceRoot string) (NodeInfo, error) {
 		GradientVersion: "dev",
 		Visibility:      VisibilityPublic,
 		InstalledSuites: suites,
-		ResolverRunning: false,
+		ResolverRunning: resolverSocketReachable(),
+		BaselineGroups:  baselineGroups,
+		DriftedGroups:   driftedGroups,
+		BaselineUpdated: baselineUpdated,
 		LastSeen:        time.Now().UTC(),
 		Address:         "",
 	}, nil
 }
 
-func (d *Daemon) refreshLoop(ctx context.Context, workspaceRoot string, state *nodeState) error {
+func (d *Daemon) refreshLoop(ctx context.Context, workspaceRoot string, state *daemonState) error {
 	ticker := time.NewTicker(d.Tick)
 	defer ticker.Stop()
 
@@ -158,21 +165,83 @@ func (d *Daemon) refreshLoop(ctx context.Context, workspaceRoot string, state *n
 			if err != nil {
 				continue
 			}
-			current := state.get()
-			next.Visibility = current.Visibility
+			currentCfg := state.currentConfig()
+			next.Visibility = currentCfg.Visibility
 			next.LastSeen = time.Now().UTC()
-			state.set(next)
+			state.setSelf(next)
 		}
 	}
 }
 
-func (d *Daemon) snapshotProvider(self *nodeState, peers *PeerList) SnapshotProvider {
+func (d *Daemon) networkLoop(ctx context.Context, state *daemonState, peers *PeerList) error {
+	var (
+		currentCfg MeshConfig
+		cancel     context.CancelFunc
+		wg         sync.WaitGroup
+	)
+
+	start := func(cfg MeshConfig) {
+		if cancel != nil {
+			cancel()
+			wg.Wait()
+		}
+		peers.Clear()
+
+		runCtx, runCancel := context.WithCancel(ctx)
+		cancel = runCancel
+		currentCfg = cfg
+		self := state.currentSelf()
+
+		launch := func(fn func(context.Context) error) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := fn(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+					// Leave cleanup to the outer loop. Returning here keeps the
+					// network workers isolated from transient restart events.
+				}
+			}()
+		}
+
+		launch(func(runCtx context.Context) error {
+			return d.Broadcaster.Broadcast(runCtx, cfg, self)
+		})
+		launch(func(runCtx context.Context) error {
+			return d.Discoverer.Discover(runCtx, cfg, peers)
+		})
+		launch(func(runCtx context.Context) error {
+			return d.servePeerAPI(runCtx, state)
+		})
+	}
+
+	start(state.currentConfig())
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+		wg.Wait()
+	}()
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			nextCfg := state.currentConfig()
+			if !sameMeshConfig(currentCfg, nextCfg) {
+				start(nextCfg)
+			}
+		}
+	}
+}
+
+func (d *Daemon) snapshotProvider(state *daemonState, peers *PeerList) SocketHandler {
 	return snapshotFunc{
 		self: func() NodeInfo {
-			if self == nil {
-				return NodeInfo{}
-			}
-			return self.get()
+			return state.currentSelf()
 		},
 		peers: func() []NodeInfo {
 			if peers == nil {
@@ -180,20 +249,53 @@ func (d *Daemon) snapshotProvider(self *nodeState, peers *PeerList) SnapshotProv
 			}
 			return peers.List()
 		},
+		setVisibility: func(visibility NodeVisibility) (NodeInfo, error) {
+			switch visibility {
+			case VisibilityPublic, VisibilityPrivate, VisibilityHidden:
+			default:
+				return NodeInfo{}, fmt.Errorf("invalid visibility %q", visibility)
+			}
+
+			cfg := state.currentConfig()
+			if err := SaveMeshConfig(cfg.WorkspaceRoot, MeshNodeConfig{
+				Visibility: visibility,
+				Peers:      cfg.Peers,
+			}); err != nil {
+				return NodeInfo{}, err
+			}
+
+			state.updateConfig(func(cfg *MeshConfig) {
+				cfg.Visibility = visibility
+			})
+			self := state.currentSelf()
+			self.Visibility = visibility
+			self.LastSeen = time.Now().UTC()
+			state.setSelf(self)
+			return self, nil
+		},
 	}
 }
 
 type snapshotFunc struct {
-	self  func() NodeInfo
-	peers func() []NodeInfo
+	self          func() NodeInfo
+	peers         func() []NodeInfo
+	setVisibility func(NodeVisibility) (NodeInfo, error)
 }
 
-type nodeState struct {
+type daemonState struct {
 	mu   sync.RWMutex
 	self NodeInfo
+	cfg  MeshConfig
 }
 
-func (s *nodeState) get() NodeInfo {
+func newDaemonState(cfg MeshConfig, self NodeInfo) *daemonState {
+	return &daemonState{
+		self: self,
+		cfg:  cfg,
+	}
+}
+
+func (s *daemonState) currentSelf() NodeInfo {
 	if s == nil {
 		return NodeInfo{}
 	}
@@ -202,13 +304,31 @@ func (s *nodeState) get() NodeInfo {
 	return s.self
 }
 
-func (s *nodeState) set(self NodeInfo) {
+func (s *daemonState) setSelf(self NodeInfo) {
 	if s == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.self = self
+}
+
+func (s *daemonState) currentConfig() MeshConfig {
+	if s == nil {
+		return MeshConfig{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cfg
+}
+
+func (s *daemonState) updateConfig(update func(*MeshConfig)) {
+	if s == nil || update == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	update(&s.cfg)
 }
 
 func (s snapshotFunc) SelfSnapshot() NodeInfo {
@@ -223,6 +343,13 @@ func (s snapshotFunc) PeerSnapshot() []NodeInfo {
 		return []NodeInfo{}
 	}
 	return s.peers()
+}
+
+func (s snapshotFunc) SetVisibility(visibility NodeVisibility) (NodeInfo, error) {
+	if s.setVisibility == nil {
+		return NodeInfo{}, fmt.Errorf("visibility updates are not supported")
+	}
+	return s.setVisibility(visibility)
 }
 
 func normalizeConfig(cfg MeshConfig) MeshConfig {
@@ -253,4 +380,21 @@ func normalizeWorkspaceRoot(workspaceRoot string) string {
 		return DefaultWorkspaceRoot()
 	}
 	return workspaceRoot
+}
+
+func sameMeshConfig(a, b MeshConfig) bool {
+	return a.WorkspaceRoot == b.WorkspaceRoot &&
+		a.SocketPath == b.SocketPath &&
+		a.Visibility == b.Visibility &&
+		a.ServicePort == b.ServicePort &&
+		reflect.DeepEqual(a.Peers, b.Peers)
+}
+
+func resolverSocketReachable() bool {
+	conn, err := net.DialTimeout("unix", "/run/gradient/resolver.sock", 200*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
 }

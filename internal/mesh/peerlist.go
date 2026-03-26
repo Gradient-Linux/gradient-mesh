@@ -33,6 +33,13 @@ func (p *PeerList) Remove(machineID string) {
 	delete(p.peers, machineID)
 }
 
+// Clear removes all peers from the current snapshot.
+func (p *PeerList) Clear() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.peers = make(map[string]NodeInfo)
+}
+
 // List returns a snapshot of all peers sorted by hostname and machine ID.
 func (p *PeerList) List() []NodeInfo {
 	p.mu.RLock()

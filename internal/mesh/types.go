@@ -22,6 +22,9 @@ type NodeInfo struct {
 	Visibility      NodeVisibility `json:"visibility"`
 	InstalledSuites []string       `json:"installed_suites"`
 	ResolverRunning bool           `json:"resolver_running"`
+	BaselineGroups  int            `json:"baseline_groups"`
+	DriftedGroups   int            `json:"drifted_groups"`
+	BaselineUpdated time.Time      `json:"baseline_updated_at"`
 	LastSeen        time.Time      `json:"last_seen"`
 	Address         string         `json:"address"`
 }
@@ -32,4 +35,5 @@ type MeshConfig struct {
 	SocketPath    string
 	Visibility    NodeVisibility
 	ServicePort   int
+	Peers         []string
 }

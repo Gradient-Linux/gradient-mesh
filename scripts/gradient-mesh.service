@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=gradient-svc
 Group=gradient-svc
-ExecStart=/usr/local/bin/gradient-mesh run
+WorkingDirectory=/var/lib/gradient
+ExecStart=/usr/local/bin/gradient-mesh run --workspace /var/lib/gradient --socket /run/gradient/mesh.sock
 Restart=on-failure
 RestartSec=15s
 RuntimeDirectory=gradient
@@ -20,4 +21,3 @@ Nice=15
 
 [Install]
 WantedBy=multi-user.target
-

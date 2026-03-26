@@ -18,7 +18,8 @@ const DefaultSocketPath = "/run/gradient/mesh.sock"
 const DefaultServicePort = 7778
 
 type socketRequest struct {
-	Action string `json:"action"`
+	Action     string `json:"action"`
+	Visibility string `json:"visibility,omitempty"`
 }
 
 type socketResponse struct {
@@ -27,16 +28,17 @@ type socketResponse struct {
 	Error string     `json:"error,omitempty"`
 }
 
-// SnapshotProvider returns the current self and peer snapshot.
-type SnapshotProvider interface {
+// SocketHandler returns the current self and peer snapshot and applies local mutations.
+type SocketHandler interface {
 	SelfSnapshot() NodeInfo
 	PeerSnapshot() []NodeInfo
+	SetVisibility(NodeVisibility) (NodeInfo, error)
 }
 
 // ServeSocket serves newline-delimited JSON queries over a Unix socket.
-func ServeSocket(ctx context.Context, socketPath string, snapshot SnapshotProvider) error {
-	if snapshot == nil {
-		return errors.New("snapshot provider is nil")
+func ServeSocket(ctx context.Context, socketPath string, handler SocketHandler) error {
+	if handler == nil {
+		return errors.New("socket handler is nil")
 	}
 
 	if socketPath == "" {
@@ -55,7 +57,7 @@ func ServeSocket(ctx context.Context, socketPath string, snapshot SnapshotProvid
 	}
 	defer listener.Close()
 	defer os.Remove(socketPath)
-	_ = os.Chmod(socketPath, 0o660)
+	_ = os.Chmod(socketPath, 0o666)
 
 	acceptErr := make(chan error, 1)
 	go func() {
@@ -68,7 +70,7 @@ func ServeSocket(ctx context.Context, socketPath string, snapshot SnapshotProvid
 				}
 				return
 			}
-			go handleSocketConn(conn, snapshot)
+			go handleSocketConn(conn, handler)
 		}
 	}()
 
@@ -107,7 +109,19 @@ func QuerySelf(socketPath string) (NodeInfo, error) {
 	return *resp.Self, nil
 }
 
-func handleSocketConn(conn net.Conn, snapshot SnapshotProvider) {
+// QuerySetVisibility updates the local mesh visibility through the daemon socket.
+func QuerySetVisibility(socketPath string, visibility NodeVisibility) (NodeInfo, error) {
+	resp, err := querySocket(socketPath, socketRequest{Action: "set_visibility", Visibility: string(visibility)})
+	if err != nil {
+		return NodeInfo{}, err
+	}
+	if resp.Self == nil {
+		return NodeInfo{}, nil
+	}
+	return *resp.Self, nil
+}
+
+func handleSocketConn(conn net.Conn, handler SocketHandler) {
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
@@ -120,10 +134,18 @@ func handleSocketConn(conn net.Conn, snapshot SnapshotProvider) {
 
 	switch req.Action {
 	case "self":
-		self := snapshot.SelfSnapshot()
+		self := handler.SelfSnapshot()
+		_ = writeSocketResponse(conn, socketResponse{Self: &self})
+	case "set_visibility":
+		visibility := NodeVisibility(req.Visibility)
+		self, err := handler.SetVisibility(visibility)
+		if err != nil {
+			_ = writeSocketResponse(conn, socketResponse{Error: err.Error()})
+			return
+		}
 		_ = writeSocketResponse(conn, socketResponse{Self: &self})
 	default:
-		_ = writeSocketResponse(conn, socketResponse{Peers: snapshot.PeerSnapshot()})
+		_ = writeSocketResponse(conn, socketResponse{Peers: handler.PeerSnapshot()})
 	}
 }
 

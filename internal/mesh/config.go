@@ -23,6 +23,9 @@ func DefaultWorkspaceRoot() string {
 	if err != nil || home == "" {
 		return filepath.Clean("/home/gradient")
 	}
+	if filepath.Base(home) == "gradient" {
+		return home
+	}
 	return filepath.Join(home, "gradient")
 }
 
